@@ -90,7 +90,7 @@ class PropNetEstimator(AbstractEstimator):
                 torch.ones((n_rays, 1), device=self.device),
             ],
             dim=-1,
-        )
+        ) # (Num Rays, 2)
         intervals = RayIntervals(vals=cdfs)
 
         for level_fn, level_samples in zip(prop_sigma_fns, prop_samples):
@@ -186,7 +186,7 @@ class PropNetEstimator(AbstractEstimator):
         loss = self.compute_loss(trans, loss_scaler)
 
         self.optimizer.zero_grad()
-        loss.backward()
+        loss.backward(retain_graph=True)
         self.optimizer.step()
         if self.scheduler is not None:
             self.scheduler.step()

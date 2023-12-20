@@ -12,11 +12,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
+import glob
+import os
 from lpips import LPIPS
 from radiance_fields.ngp import NGPDensityField, NGPRadianceField
+from torch.utils.tensorboard import SummaryWriter
 from losses import NeRFLoss
 from schedulers import create_scheduler
-torch.autograd.set_detect_anomaly(True)
+from cluster_manager import ClusterStateManager
 
 from examples.utils import (
     LLFF_NDC_SCENES,
@@ -29,6 +32,7 @@ from nerfacc.estimators.prop_net import (
     get_proposal_requires_grad_fn,
 )
 
+cm = ClusterStateManager()
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "--data_root",
@@ -82,8 +86,14 @@ parser.add_argument(
     type=float,
     default=0.1,
 )
+parser.add_argument(
+    "--logdir",
+    type=str,
+    default="./logs",
+)
 args = parser.parse_args()
 
+writer = SummaryWriter(args.logdir)
 device = "cuda:0"
 set_random_seed(42)
 
@@ -196,6 +206,26 @@ scheduler = create_scheduler(optimizer, args.scheduler, max_steps, 1e-2)
 proposal_requires_grad_fn = get_proposal_requires_grad_fn()
 # proposal_annealing_fn = get_proposal_annealing_fn()
 
+# load ckpt
+ckpts = glob.glob(os.path.join(args.logdir, "*.pt"))
+if len(ckpts) > 0:
+    ckpts.sort()
+    latest_ckpt = ckpts[-1]
+    ckpt_state = torch.load(latest_ckpt, map_location=device)
+    
+    # Load states
+    prop_optimizer.load_state_dict(ckpt_state["prop_optimizer"])
+    estimator.load_state_dict(ckpt_state["estimator"])
+    
+    radiance_field.load_state_dict(ckpt_state["radiance_field"])
+    optimizer.load_state_dict(ckpt_state["optimizer"])
+    scheduler.load_state_dict(ckpt_state["scheduler"])
+
+    start_step = ckpt_state["start_step"]
+
+else:
+    start_step = 0
+
 lpips_net = LPIPS(net="vgg").to(device)
 lpips_norm_fn = lambda x: x[None, ...].permute(0, 3, 1, 2) * 2 - 1
 lpips_fn = lambda x, y: lpips_net(lpips_norm_fn(x), lpips_norm_fn(y)).mean()
@@ -207,7 +237,7 @@ lossperpix_prev = None
 
 # training
 tic = time.time()
-for step in range(max_steps + 1):
+for step in range(start_step, max_steps + 1):
     radiance_field.train()
     for p in proposal_networks:
         p.train()
@@ -215,7 +245,6 @@ for step in range(max_steps + 1):
 
     i = torch.randint(0, len(train_dataset), (1,)).item()
     data = train_dataset.__getitem__(i, net_grad=gradval, loss_per_pix=lossperpix_prev)
-
 
     render_bkgd = data["color_bkgd"]
     rays = data["rays"]
@@ -268,16 +297,32 @@ for step in range(max_steps + 1):
     loss = loss_per_pix.mean()
 
     optimizer.zero_grad()
-    # do not unscale it because we are using Adam.
+    
+    # Do not use GradScaler for optimization
+    # # do not unscale it because we are using Adam.
     grad_scaler.scale(loss).backward()
-    optimizer.step()
+    grad_scaler.step(optimizer)
+    grad_scaler.update()
+    # loss.backward()
+    # optimizer.step()
     scheduler.step()
+
+    if cm.should_exit():
+        state = {
+            "prop_optimizer": prop_optimizer.state_dict(),
+            "estimator": estimator.state_dict(),
+            "radiance_field": radiance_field.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "start_step": step
+        }
+        torch.save(os.path.join(args.logdir, "{:04d}.pt".format(step)), state)
+        cm.requeue()
 
     if args.sampling_type == "lmc":
         with torch.no_grad():            
             net_grad = data['points_2d'].grad.detach()
             loss_per_pix = loss_per_pix.detach()
-            net_grad = net_grad / ((grad_scaler._scale * (correction * loss_per_pix).unsqueeze(1))+ torch.finfo(net_grad.dtype).eps)
+            net_grad = net_grad / ((grad_scaler._scale * (correction * loss_per_pix).unsqueeze(1)) + torch.finfo(net_grad.dtype).eps)
             gradval = net_grad
             lossperpix_prev = loss_per_pix
 
@@ -307,6 +352,17 @@ for step in range(max_steps + 1):
                 render_bkgd = data["color_bkgd"]
                 rays = data["rays"]
                 pixels = data["pixels"]
+
+                if cm.should_exit():
+                    state = {
+                        "prop_optimizer": prop_optimizer.state_dict(),
+                        "estimator": estimator.state_dict(),
+                        "radiance_field": radiance_field.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "start_step": step
+                    }
+                    torch.save(os.path.join(args.logdir, "{:04d}.pt".format(step)), state)
+                    cm.requeue()
 
                 # rendering
                 rgb, acc, depth, _, _ = render_image_with_propnet(
@@ -341,6 +397,9 @@ for step in range(max_steps + 1):
                 #         ).astype(np.uint8),
                 #     )
                 #     break
+        
         psnr_avg = sum(psnrs) / len(psnrs)
         lpips_avg = sum(lpips) / len(lpips)
+        writer.add_scalar("test/psnr", psnr_avg, step)
+        writer.add_scalar("test/lpips", lpips_avg, step)
         print(f"evaluation: psnr_avg={psnr_avg}, lpips_avg={lpips_avg}")
